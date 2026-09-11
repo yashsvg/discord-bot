@@ -137,6 +137,7 @@ class TreasureHuntBot(discord.Client):
         self.route_cache = {}            # team_name -> [{"row_index", "location_id", "solved"}, ...] in order
         self.hunt_started_at = None      # cached string, set at /start, cleared at /reset
         self.hunt_ended = False          # cached bool, set at /end, cleared at /reset
+        self.leaderboard_interval_seconds = 30
         self.team_locks = {}             # team_name -> asyncio.Lock, serializes /scan per team
         self.awaiting_photo = {}         # team_name -> {"location_id": str, "next_idx": int, "is_finished": bool}
         self.photo_prompt_messages = {}  # team_name -> (channel_id, message_id) of the "upload a photo" prompt
@@ -174,20 +175,28 @@ def refresh_header_maps():
         "Teams": get_header_map(teams_ws),
         "Team_Routes": get_header_map(routes_ws),
         "Settings": get_header_map(settings_ws),
-        "Config": get_header_map(config_ws),
+        # Config is read with get_all_records(); it is not written through col().
     }
 
 
-def col(sheet_key: str, header_name: str, fallback: int = None) -> int:
-    """Look up a column's current index by header name. Falls back to the documented default
-    position only if the header map hasn't been built yet or the header is genuinely missing
-    (so a mid-event bot restart doesn't hard-crash on the very first write)."""
+def col(sheet_key: str, header_name: str) -> int:
+    """Look up a required column by header name and fail loudly if it is missing."""
     hm = client.header_maps.get(sheet_key)
     if hm and header_name in hm:
         return hm[header_name]
-    if fallback is not None:
-        return fallback
     raise KeyError(f"Column '{header_name}' not found in the {sheet_key} sheet's header row.")
+
+
+def append_record_by_headers(sheet_key: str, ws, values: dict):
+    """Append a row by header names so reordered sheets cannot scramble new records."""
+    headers = ws.row_values(1)
+    if not headers:
+        raise KeyError(f"The {sheet_key} sheet has no header row.")
+    actual = {str(header).strip() for header in headers if str(header).strip()}
+    missing = set(values) - actual
+    if missing:
+        raise KeyError(f"Missing required columns in {sheet_key}: {', '.join(sorted(missing))}")
+    ws.append_row([values.get(str(header).strip(), "") for header in headers])
 
 
 def build_static_caches():
@@ -275,12 +284,16 @@ def get_setting(key: str):
 
 def set_setting(key: str, value):
     records = settings_ws.get_all_records()
-    value_col = col("Settings", "Value", fallback=2)
+    value_col = col("Settings", "Value")
     for idx, row in enumerate(records, start=2):
         if row.get("Key") == key:
             settings_ws.update_cell(idx, value_col, value)
             return
-    settings_ws.append_row([key, value, "Auto-managed by bot"])
+    append_record_by_headers(
+        "Settings",
+        settings_ws,
+        {"Key": key, "Value": value, "Description": "Auto-managed by bot"},
+    )
 
 
 # ============================================================
@@ -349,13 +362,13 @@ def get_team_registrations():
             continue
 
         member_ids = []
-        for col in id_columns:
-            raw = str(row.get(col, "")).strip()
+        for id_column in id_columns:
+            raw = str(row.get(id_column, "")).strip()
             if not raw:
                 continue  # blank slot (e.g. a 3-person team on a 4-slot form) — fine, skip
             if not raw.isdigit():
                 bad_rows.append(
-                    f"Row {idx} ({team}), column '{col}': \"{raw}\" isn't a plain numeric "
+                    f"Row {idx} ({team}), column '{id_column}': \"{raw}\" isn't a plain numeric "
                     f"Discord user ID — that member was skipped."
                 )
                 continue
@@ -430,12 +443,22 @@ def upsert_team_channel_id(team_name: str, channel_id: int):
     """Writes this team's channel ID into the Teams sheet — creates the row if the team
     doesn't have one yet (e.g. it only exists so far because of a Registrations submission)."""
     records = teams_ws.get_all_records()
-    channel_col = col("Teams", "Discord_Channel_ID", fallback=2)
+    channel_col = col("Teams", "Discord_Channel_ID")
     for idx, row in enumerate(records, start=2):
         if row.get("Team_Name") == team_name:
             teams_ws.update_cell(idx, channel_col, str(channel_id))
             return
-    teams_ws.append_row([team_name, str(channel_id), "", 0, "", ""])
+    append_record_by_headers(
+        "Teams",
+        teams_ws,
+        {
+            "Team_Name": team_name,
+            "Discord_Channel_ID": str(channel_id),
+            "Current_Position": 0,
+            "Started_At": "",
+            "Finished_At": "",
+        },
+    )
 
 
 def get_or_create_results_ws():
@@ -692,8 +715,15 @@ async def finalize_team_completion(team_name: str, channel: discord.abc.Messagea
     the completion message (no photo needed for the final step), and pings #admin."""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     row_idx = client.team_row_cache.get(team_name)
-    finished_col = col("Teams", "Finished_At", fallback=6)
-    finish_write = asyncio.to_thread(teams_ws.update_cell, row_idx, finished_col, now) if row_idx else asyncio.sleep(0)
+    if row_idx is None:
+        await warn_admin(
+            f"⚠️ Could not record Finished_At for **{team_name}**: "
+            "the team row was not found in the cache."
+        )
+        finish_write = None
+    else:
+        finished_col = col("Teams", "Finished_At")
+        finish_write = asyncio.to_thread(teams_ws.update_cell, row_idx, finished_col, now)
 
     await cleanup_finished_team_channel(team_name)
     completion_text = (
@@ -701,7 +731,10 @@ async def finalize_team_completion(team_name: str, channel: discord.abc.Messagea
         "Collect your item here, then run to the front of the mess block to complete the event! 🏃💨"
     )
     final_msg_task = channel.send(completion_text)
-    await asyncio.gather(finish_write, final_msg_task)
+    tasks_to_wait = [final_msg_task]
+    if finish_write is not None:
+        tasks_to_wait.append(finish_write)
+    await asyncio.gather(*tasks_to_wait)
 
     elapsed_str = "unknown"
     if client.hunt_started_at:
@@ -833,8 +866,11 @@ async def start(interaction: discord.Interaction):
     # instead of only appearing piecemeal as teams happen to upload photos.
     photo_category, photo_cat_error = await ensure_photo_category(interaction.guild)
     photo_channel_errors = []
+    started_teams = []
 
-    async def start_one_team(team_name: str, channel_id: int):
+    async def start_one_team(team_name: str, channel_id: int | None):
+        if channel_id is None:
+            return f"{team_name} (no Discord channel linked)"
         channel = client.get_channel(channel_id)
         if channel is None:
             return f"{team_name} (bot can't see that channel)"
@@ -864,22 +900,28 @@ async def start(interaction: discord.Interaction):
         location_id = steps[0]["location_id"]
         clue_text = client.config_cache.get(location_id, {}).get("clue_text", "(clue not found)")
         await post_clue_message(channel, team_name, clue_text)
+        started_teams.append(team_name)
         return None
 
     tasks_list = [
-        start_one_team(team_name, ch_id)
-        for ch_id, team_name in client.channel_team_cache.items()
+        start_one_team(team_name, team_channel_id(team_name))
+        for team_name in client.team_row_cache
     ]
     results = await asyncio.gather(*tasks_list)
     skipped = [r for r in results if r]
     started_count = len(results) - len(skipped)
 
     set_setting("Hunt_Started_At", now)
-    all_teams_values = teams_ws.get_all_values()
-    num_team_rows = len(all_teams_values) - 1
-    if num_team_rows > 0:
-        started_letter = gspread.utils.rowcol_to_a1(1, col("Teams", "Started_At", fallback=5)).rstrip("1")
-        teams_ws.update(f"{started_letter}2:{started_letter}{1 + num_team_rows}", [[now] for _ in range(num_team_rows)])
+    started_col = col("Teams", "Started_At")
+    started_updates = [
+        {
+            "range": gspread.utils.rowcol_to_a1(client.team_row_cache[team_name], started_col),
+            "values": [[now]],
+        }
+        for team_name in started_teams
+    ]
+    if started_updates:
+        await asyncio.to_thread(teams_ws.batch_update, started_updates)
 
     summary = f"✅ Hunt started for {started_count} team(s) at {now}."
     if photo_cat_error:
@@ -909,22 +951,22 @@ async def reset(interaction: discord.Interaction):
     num_route_rows = len(all_routes) - 1
     num_team_rows = len(all_teams) - 1
 
-    def fill_column(ws, header_name: str, fallback_col: int, value, num_rows: int):
+    def fill_column(ws, header_name: str, value, num_rows: int):
         """Writes `value` down a single named column for `num_rows` rows starting at row 2.
         Resolved by header name (not assumed adjacency to other columns), so it's safe even
         if the reset columns aren't next to each other after a reorder."""
-        letter = gspread.utils.rowcol_to_a1(1, col(ws.title, header_name, fallback=fallback_col)).rstrip("1")
+        letter = gspread.utils.rowcol_to_a1(1, col(ws.title, header_name)).rstrip("1")
         ws.update(f"{letter}2:{letter}{1 + num_rows}", [[value] for _ in range(num_rows)])
 
     async def do_sheet_writes():
         write_tasks = []
         if num_route_rows > 0:
-            write_tasks.append(asyncio.to_thread(fill_column, routes_ws, "Solved", 4, "N", num_route_rows))
-            write_tasks.append(asyncio.to_thread(fill_column, routes_ws, "Solved_At", 5, "", num_route_rows))
+            write_tasks.append(asyncio.to_thread(fill_column, routes_ws, "Solved", "N", num_route_rows))
+            write_tasks.append(asyncio.to_thread(fill_column, routes_ws, "Solved_At", "", num_route_rows))
         if num_team_rows > 0:
-            write_tasks.append(asyncio.to_thread(fill_column, teams_ws, "Current_Position", 4, 0, num_team_rows))
-            write_tasks.append(asyncio.to_thread(fill_column, teams_ws, "Started_At", 5, "", num_team_rows))
-            write_tasks.append(asyncio.to_thread(fill_column, teams_ws, "Finished_At", 6, "", num_team_rows))
+            write_tasks.append(asyncio.to_thread(fill_column, teams_ws, "Current_Position", 0, num_team_rows))
+            write_tasks.append(asyncio.to_thread(fill_column, teams_ws, "Started_At", "", num_team_rows))
+            write_tasks.append(asyncio.to_thread(fill_column, teams_ws, "Finished_At", "", num_team_rows))
         write_tasks.append(asyncio.to_thread(set_setting, "Hunt_Started_At", ""))
         write_tasks.append(asyncio.to_thread(set_setting, "Hunt_Ended_At", ""))
         write_tasks.append(asyncio.to_thread(clear_results_ws))
@@ -1216,8 +1258,8 @@ async def scan(interaction: discord.Interaction, code: str):
 
             # The Sheet write is the only slow, blocking part — run it in a worker thread so
             # it happens IN PARALLEL with the Discord messages below, not before them.
-            solved_col = col("Team_Routes", "Solved", fallback=4)
-            solved_at_col = col("Team_Routes", "Solved_At", fallback=5)
+            solved_col = col("Team_Routes", "Solved")
+            solved_at_col = col("Team_Routes", "Solved_At")
             sheet_write = asyncio.to_thread(
                 routes_ws.batch_update,
                 [
@@ -1235,7 +1277,6 @@ async def scan(interaction: discord.Interaction, code: str):
                 # Final clue: no photo needed — they'll get a physical item in person instead.
                 await finalize_team_completion(team_name, interaction.channel)
                 await sheet_write
-                await clear_wrong_code_messages(team_name)
             else:
                 # Every OTHER clue requires a group photo at that location before the next
                 # one unlocks — remember what's next so on_message can pick up where this left off.
@@ -1269,12 +1310,15 @@ async def scan(interaction: discord.Interaction, code: str):
 
 @tasks.loop(seconds=30)
 async def update_leaderboard():
-    try:
-        refresh_val = get_setting("Leaderboard_Refresh_Seconds")  # looked up by Key, not a fixed cell
-        if refresh_val and update_leaderboard.seconds != int(refresh_val):
-            update_leaderboard.change_interval(seconds=int(refresh_val))
-    except Exception:
-        pass
+    refresh_val = get_setting("Leaderboard_Refresh_Seconds")  # looked up by Key, not a fixed cell
+    if refresh_val:
+        try:
+            requested_seconds = int(refresh_val)
+        except (TypeError, ValueError):
+            requested_seconds = client.leaderboard_interval_seconds
+        if requested_seconds > 0 and requested_seconds != client.leaderboard_interval_seconds:
+            client.leaderboard_interval_seconds = requested_seconds
+            update_leaderboard.change_interval(seconds=requested_seconds)
 
     channel = discord.utils.get(client.get_all_channels(), name=LEADERBOARD_CHANNEL_NAME)
     if channel is None:
@@ -1503,10 +1547,6 @@ async def ensure_admin_command_guide():
     except (discord.Forbidden, discord.HTTPException):
         pass
 
-
-# ============================================================
-# Photo submission listener — detects a team's finish-line selfie
-# ============================================================
 
 # ============================================================
 # Photo submission listener — every clue requires a group photo
