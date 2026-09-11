@@ -139,6 +139,7 @@ class TreasureHuntBot(discord.Client):
         self.hunt_ended = False          # cached bool, set at /end, cleared at /reset
         self.leaderboard_interval_seconds = 30
         self.team_locks = {}             # team_name -> asyncio.Lock, serializes /scan per team
+        self.photo_structure_lock = asyncio.Lock()  # serializes Photo Proofs category/channel creation
         self.awaiting_photo = {}         # team_name -> {"location_id": str, "next_idx": int, "is_finished": bool}
         self.photo_prompt_messages = {}  # team_name -> (channel_id, message_id) of the "upload a photo" prompt
         self.photo_sent_messages = {}    # team_name -> (channel_id, message_id) of the latest "Photo is sent." confirmation
@@ -651,23 +652,24 @@ async def ensure_photo_category(guild: discord.Guild):
     the category couldn't be created. Previously a Forbidden here was only printed to the
     console, so the organizer had no idea Photo Proofs silently never got created — now the
     caller surfaces this error directly."""
-    category = discord.utils.get(guild.categories, name=PHOTO_CATEGORY_NAME)
-    if category is not None:
-        return category, None
+    async with client.photo_structure_lock:
+        category = discord.utils.get(guild.categories, name=PHOTO_CATEGORY_NAME)
+        if category is not None:
+            return category, None
 
-    admin_channel = discord.utils.get(guild.text_channels, name=ADMIN_CHANNEL_NAME)
-    overwrites = dict(admin_channel.overwrites) if admin_channel else {}
-    overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
-    try:
-        category = await guild.create_category(PHOTO_CATEGORY_NAME, overwrites=overwrites)
-        return category, None
-    except discord.Forbidden:
-        return None, (
-            "missing permissions — the bot's role needs **Manage Channels** and "
-            "**Manage Roles** to create a private category with custom overwrites."
-        )
-    except discord.HTTPException as e:
-        return None, str(e)
+        admin_channel = discord.utils.get(guild.text_channels, name=ADMIN_CHANNEL_NAME)
+        overwrites = dict(admin_channel.overwrites) if admin_channel else {}
+        overwrites[guild.default_role] = discord.PermissionOverwrite(view_channel=False)
+        try:
+            category = await guild.create_category(PHOTO_CATEGORY_NAME, overwrites=overwrites)
+            return category, None
+        except discord.Forbidden:
+            return None, (
+                "missing permissions — the bot's role needs **Manage Channels** and "
+                "**Manage Roles** to create a private category with custom overwrites."
+            )
+        except discord.HTTPException as e:
+            return None, str(e)
 
 
 async def ensure_team_photo_channel(team_name: str, category, guild: discord.Guild):
@@ -679,16 +681,17 @@ async def ensure_team_photo_channel(team_name: str, category, guild: discord.Gui
     if category is None:
         return None, "no Photo Proofs category available"
     channel_name = team_name.lower().replace(" ", "-") + "-photo"
-    channel = discord.utils.get(category.text_channels, name=channel_name)
-    if channel is not None:
-        return channel, None
-    try:
-        channel = await guild.create_text_channel(channel_name, category=category)
-        return channel, None
-    except discord.Forbidden:
-        return None, "missing permissions — the bot's role needs **Manage Channels**."
-    except discord.HTTPException as e:
-        return None, str(e)
+    async with client.photo_structure_lock:
+        channel = discord.utils.get(category.text_channels, name=channel_name)
+        if channel is not None:
+            return channel, None
+        try:
+            channel = await guild.create_text_channel(channel_name, category=category)
+            return channel, None
+        except discord.Forbidden:
+            return None, "missing permissions — the bot's role needs **Manage Channels**."
+        except discord.HTTPException as e:
+            return None, str(e)
 
 
 async def mirror_photo_proof(team_name: str, guild: discord.Guild, location_id: str, file_bytes: bytes, filename: str):
@@ -1630,3 +1633,5 @@ async def on_ready():
 
 
 client.run(BOT_TOKEN)
+ 
+
